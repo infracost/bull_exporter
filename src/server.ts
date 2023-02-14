@@ -99,6 +99,7 @@ export async function makeServer(opts: Options): Promise<express.Application> {
   });
 
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    logger.error(err.stack);
     res.status(500);
     res.send({
       err: (err && err.message) || 'Unknown error',
@@ -112,7 +113,7 @@ export async function startServer(opts: Options): Promise<{ done: Promise<void> 
   const app = await makeServer(opts);
 
   let server: http.Server;
-  await new Promise((resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
     server = app.listen(opts.port, opts.bindAddress, (err: any) => {
       if (err) {
         reject(err);

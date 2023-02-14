@@ -1,13 +1,12 @@
-import bull from 'bull';
+import { Queue, QueueEvents, QueueOptions } from 'bullmq';
 import * as Logger from 'bunyan';
-import { EventEmitter } from 'events';
-import IoRedis from 'ioredis';
+import IoRedis, { RedisOptions } from 'ioredis';
 import { register as globalRegister, Registry } from 'prom-client';
 
 import { logger as globalLogger } from './logger';
 import { getJobCompleteStats, getStats, makeGuages, QueueGauges } from './queueGauges';
 
-export interface MetricCollectorOptions extends Omit<bull.QueueOptions, 'redis'> {
+export interface MetricCollectorOptions extends Omit<QueueOptions, 'redis'> {
   metricPrefix: string;
   redis: string;
   autoDiscover: boolean;
@@ -15,7 +14,7 @@ export interface MetricCollectorOptions extends Omit<bull.QueueOptions, 'redis'>
 }
 
 export interface QueueData<T = unknown> {
-  queue: bull.Queue<T>;
+  queue: Queue<T>;
   name: string;
   prefix: string;
 }
@@ -24,16 +23,16 @@ export class MetricCollector {
 
   private readonly logger: Logger;
 
-  private readonly defaultRedisClient: IoRedis.Redis;
+  private conn: IoRedis | undefined;
   private readonly redisUri: string;
-  private readonly bullOpts: Omit<bull.QueueOptions, 'redis'>;
+  private readonly bullOpts: Omit<QueueOptions, 'redis'>;
   private readonly queuesByName: Map<string, QueueData<unknown>> = new Map();
 
   private get queues(): QueueData<unknown>[] {
     return [...this.queuesByName.values()];
   }
 
-  private readonly myListeners: Set<(id: string) => Promise<void>> = new Set();
+  private readonly queueEvents: Set<QueueEvents> = new Set();
 
   private readonly guages: QueueGauges;
 
@@ -44,19 +43,24 @@ export class MetricCollector {
   ) {
     const { logger, autoDiscover, redis, metricPrefix, ...bullOpts } = opts;
     this.redisUri = redis;
-    this.defaultRedisClient = new IoRedis(this.redisUri);
-    this.defaultRedisClient.setMaxListeners(32);
     this.bullOpts = bullOpts;
     this.logger = logger || globalLogger;
     this.addToQueueSet(queueNames);
     this.guages = makeGuages(metricPrefix, registers);
   }
 
-  private createClient(_type: 'client' | 'subscriber' | 'bclient', redisOpts?: IoRedis.RedisOptions): IoRedis.Redis {
-    if (_type === 'client') {
-      return this.defaultRedisClient!;
+  private connection(): IoRedis {
+    if (this.conn) {
+      return this.conn;
     }
-    return new IoRedis(this.redisUri, redisOpts);
+
+    const connOpts: RedisOptions = {
+      maxRetriesPerRequest: null,
+    };
+
+    this.conn = new IoRedis(this.redisUri, connOpts);
+
+    return this.conn;
   }
 
   private addToQueueSet(names: string[]): void {
@@ -67,9 +71,9 @@ export class MetricCollector {
       this.logger.info('added queue', name);
       this.queuesByName.set(name, {
         name,
-        queue: new bull(name, {
+        queue: new Queue(name, {
           ...this.bullOpts,
-          createClient: this.createClient.bind(this),
+          connection: this.connection(),
         }),
         prefix: this.bullOpts.prefix || 'bull',
       });
@@ -80,7 +84,7 @@ export class MetricCollector {
     const keyPattern = new RegExp(`^${this.bullOpts.prefix}:([^:]+):(id|failed|active|waiting|stalled-check)$`);
     this.logger.info({ pattern: keyPattern.source }, 'running queue discovery');
 
-    const keyStream = this.defaultRedisClient.scanStream({
+    const keyStream = this.connection().scanStream({
       match: `${this.bullOpts.prefix}:*:*`,
     });
     // tslint:disable-next-line:await-promise tslint does not like Readable's here
@@ -94,24 +98,25 @@ export class MetricCollector {
     }
   }
 
-  private async onJobComplete(queue: QueueData, id: string): Promise<void> {
+  private async onJobComplete(queue: QueueData, { jobId }: { jobId: string }): Promise<void> {
     try {
-      const job = await queue.queue.getJob(id);
+      const job = await queue.queue.getJob(jobId);
       if (!job) {
-        this.logger.warn({ job: id }, 'unable to find job from id');
+        this.logger.warn({ job: jobId }, 'unable to find job from id');
         return;
       }
       await getJobCompleteStats(queue.prefix, queue.name, job, this.guages);
     } catch (err) {
-      this.logger.error({ err, job: id }, 'unable to fetch completed job');
+      this.logger.error({ err, job: jobId }, 'unable to fetch completed job');
     }
   }
 
   public collectJobCompletions(): void {
     for (const q of this.queues) {
       const cb = this.onJobComplete.bind(this, q);
-      this.myListeners.add(cb);
-      q.queue.on('global:completed', cb);
+      const queueEvents = new QueueEvents(q.name, { connection: this.connection() });
+      this.queueEvents.add(queueEvents);
+      queueEvents.on('completed', cb);
     }
   }
 
@@ -121,16 +126,12 @@ export class MetricCollector {
   }
 
   public async ping(): Promise<void> {
-    await this.defaultRedisClient.ping();
+    await this.connection().ping();
   }
 
   public async close(): Promise<void> {
-    this.defaultRedisClient.disconnect();
-    for (const q of this.queues) {
-      for (const l of this.myListeners) {
-        (q.queue as any as EventEmitter).removeListener('global:completed', l);
-      }
-    }
+    this.connection().disconnect();
+    await Promise.all([...this.queueEvents].map(qe => qe.close()));
     await Promise.all(this.queues.map(q => q.queue.close()));
   }
 
