@@ -25,14 +25,13 @@
     "tslint-config-airbnb": "5.11.2",
     "tslint-eslint-rules": "5.4.0",
     "tslint-microsoft-contrib": "6.2.0",
-    "typescript": "3.9.6"
+    "typescript": "4.9.5"
   },
   "dependencies": {
-    "@types/bull": "^3.5.4",
     "@types/bunyan": "^1.8.5",
     "@types/uuid": "^8.0.0",
     "@types/yargs": "^15.0.0",
-    "bull": "^3.6.0",
+    "bullmq": "^1.89.2",
     "bunyan": "^1.8.12",
     "express": "^4.17.1",
     "prom-client": "^12.0.0",
